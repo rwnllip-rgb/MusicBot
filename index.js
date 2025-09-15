@@ -17,18 +17,18 @@ const {
   TextInputBuilder,
   TextInputStyle,
   Events,
+  PermissionFlagsBits,
 } = require('discord.js');
 
 const mongoose = require('mongoose');
 const { LavalinkManager } = require('lavalink-client');
 
 // ====== إعدادات ثابتة ======
-const CONTROL_TEXT_CHANNEL_ID = '1410843136594411520';
+const CONTROL_TEXT_CHANNEL_ID = process.env.CONTROL_TEXT_CHANNEL_ID || '1410843136594411520';
 const PANEL_UPDATE_INTERVAL_MS = 15000;
 const DEFAULT_VOLUME = 50;
 const MAX_PLAYLIST_SLOTS_PER_ROW = 5;
 const MAX_PLAYLIST_ROWS = 3;
-const PLAYLIST_DELETE_TOGGLE_ID = 'pl:toggleDelete';
 
 // عقدة Lavalink
 const LAVALINK_NODES = [
@@ -115,15 +115,15 @@ const PlaylistModel = mongoose.model('Playlist', playlistSchema);
 const fmtTime = (ms) => {
   if (!ms || ms < 0) ms = 0;
   const totalSec = Math.floor(ms / 1000);
-  const m = Math.floor(totalSec / 60).toString().padStart(2, '0');
-  const s = (totalSec % 60).toString().padStart(2, '0');
-  return `${m}:${s}`;
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 };
 
 const resolveArtwork = (track) =>
-  track?.info?.artworkUrl ||
-  track?.artworkUrl ||
-  (track?.info?.identifier ? `https://i.ytimg.com/vi/${track.info.identifier}/hqdefault.jpg` : null);
+  track?.info?.artworkUrl || track?.artworkUrl || null;
 
 const ensureGuild = async (guildId) => {
   let doc = await GuildModel.findOne({ guildId });
@@ -131,14 +131,24 @@ const ensureGuild = async (guildId) => {
   return doc;
 };
 
-// بحث متعدد المصادر مع fallback
+// تشفير/فك اسم القائمة داخل customId
+const encName = (s) => encodeURIComponent(s);
+const decName = (s) => decodeURIComponent(s || '');
+
+// customId helpers: "pl|action|userId|data..."
+const makeId = (...parts) => parts.join('|');
+const parseId = (customId) => customId.split('|');
+
+// بحث متعدد المصادر مع إرجاع أول نتيجة فقط عند البحث النصي
 const searchWithFallback = async (player, query, requester) => {
   const isUrl = /^https?:\/\//i.test(query);
   const sources = ['ytsearch', 'ytmsearch', 'scsearch', 'spsearch', 'ymsearch', 'amsearch'];
+
   if (isUrl) {
     const res = await player.search({ query }, requester).catch(() => null);
     if (res?.tracks?.length) return res;
   }
+
   for (const source of sources) {
     const res = await player.search({ query, source }, requester).catch(() => null);
     if (res?.tracks?.length) return res;
@@ -146,6 +156,7 @@ const searchWithFallback = async (player, query, requester) => {
   return null;
 };
 
+// لوحة التحكم
 const buildControlRows = (settings) => {
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('ctl:volUp').setLabel('رفع الصوت').setStyle(ButtonStyle.Primary),
@@ -161,7 +172,7 @@ const buildControlRows = (settings) => {
   );
   const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('ctl:playlist').setLabel('البلايليست').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('ctl:save').setLabel('حفظ').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ctl:save').setLabel('حفظ الحالية').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('ctl:next').setLabel('التالي').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('ctl:prev').setLabel('السابق').setStyle(ButtonStyle.Primary),
   );
@@ -242,7 +253,7 @@ const ensurePanel = async (guild, channel, player, settings) => {
   }
 };
 
-// إضافة للطابور (بدون منع تكرار)
+// إضافة للطابور
 const enqueueTracks = async (player, tracks) => {
   if (!tracks?.length) return false;
   player.queue.add(tracks);
@@ -250,41 +261,39 @@ const enqueueTracks = async (player, tracks) => {
   return true;
 };
 
-// التالي/السابق
-const playNext = async (player, settings, { keepCurrent = false, random = false } = {}) => {
-  const q = player.queue;
-  if (settings.shuffle || random) {
-    if (q.tracks.length > 0) {
-      const idx = Math.floor(Math.random() * q.tracks.length);
-      const [picked] = q.tracks.splice(idx, 1);
-      if (keepCurrent && q.current) q.add(q.current);
-      q.current = picked;
-      await player.play(picked);
-      return;
-    }
-  }
-  if (keepCurrent && q.current) q.add(q.current);
-  await player.skip();
+// ====== نظام السابق/التالي (تاريخ محلي) ======
+const lastTrackMap = new Map(); // guildId -> last current track
+const historyMap = new Map();   // guildId -> array of previous tracks
+
+const pushHistory = (guildId, track) => {
+  if (!track) return;
+  if (!historyMap.has(guildId)) historyMap.set(guildId, []);
+  historyMap.get(guildId).push(track);
 };
 
-const playPrev = async (player, settings) => {
+const playPrevCustom = async (player, settings) => {
+  const guildId = player.guildId;
   const q = player.queue;
-  if (settings.shuffle) {
-    if (q.current) await player.play(q.current, { startTime: 0 });
+  const hist = historyMap.get(guildId) || [];
+
+  // إذا قطع المستخدم مسافة من الأغنية الحالية، أعدها للبداية
+  if ((player.position || 0) > 3000 && q.current) {
+    await player.play(q.current, { startTime: 0 });
     return;
   }
-  if (q.previous.length) {
-    const prev = q.previous.pop();
+
+  if (hist.length > 0) {
+    const prev = hist.pop();
     if (q.current) q.tracks.unshift(q.current);
     q.current = prev;
-    await player.play(prev);
-  } else {
-    if (q.current) await player.play(q.current, { startTime: 0 });
+    await player.play(prev, { startTime: 0 });
+  } else if (q.current) {
+    await player.play(q.current, { startTime: 0 });
   }
 };
 
-// ====== Playlists UI ======
-const buildPlaylistsListMessage = async (guildId, userId) => {
+// ====== Playlists UI (غير إمفيرال + حماية بالمالك) ======
+const buildPlaylistsListRows = async (guildId, userId) => {
   const lists = await PlaylistModel.find({ guildId, userId }).sort({ name: 1 });
   const names = lists.map((l) => l.name);
 
@@ -296,8 +305,10 @@ const buildPlaylistsListMessage = async (guildId, userId) => {
   for (let r = 0; r < MAX_PLAYLIST_ROWS; r++) {
     const row = new ActionRowBuilder();
     for (let c = 0; c < MAX_PLAYLIST_SLOTS_PER_ROW; c++) {
-      const label = idx < filled ? names[idx] : 'فراغ';
-      const id = idx < filled ? `pl:open:${names[idx]}` : `pl:create:${r}:${c}`;
+      const label = idx < filled ? names[idx] : 'إنشاء';
+      const id = idx < filled
+        ? makeId('pl', 'open', userId, encName(names[idx]))
+        : makeId('pl', 'create', userId);
       row.addComponents(
         new ButtonBuilder()
           .setCustomId(id)
@@ -309,14 +320,17 @@ const buildPlaylistsListMessage = async (guildId, userId) => {
     rows.push(row);
   }
   const lastRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(PLAYLIST_DELETE_TOGGLE_ID).setLabel('حذف').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(makeId('pl', 'toggleDelete', userId))
+      .setLabel('وضع حذف')
+      .setStyle(ButtonStyle.Danger),
   );
   rows.push(lastRow);
 
   return rows;
 };
 
-const buildSinglePlaylistView = (plist) => {
+const buildSinglePlaylistView = (plist, userId) => {
   const emb = new EmbedBuilder()
     .setColor(0x8bc34a)
     .setTitle(`البلايليست: ${plist.name}`)
@@ -324,22 +338,22 @@ const buildSinglePlaylistView = (plist) => {
     .setTimestamp(new Date());
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`pl:back`).setLabel('عودة').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`pl:add:${plist.name}`).setLabel('إضافة').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`pl:del:${plist.name}`).setLabel('حذف').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(`pl:play:${plist.name}`).setLabel('تشغيل').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(makeId('pl', 'back', userId)).setLabel('عودة').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(makeId('pl', 'add', userId, encName(plist.name))).setLabel('إضافة').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(makeId('pl', 'del', userId, encName(plist.name))).setLabel('حذف عناصر').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(makeId('pl', 'play', userId, encName(plist.name))).setLabel('تشغيل').setStyle(ButtonStyle.Success),
   );
 
   return { embed: emb, rows: [row] };
 };
 
-const showDeleteMenus = (plist) => {
+const showDeleteMenus = (plist, userId) => {
   const chunks = [];
   for (let i = 0; i < plist.items.length; i += 25) chunks.push(plist.items.slice(i, i + 25));
   const rows = [];
   chunks.forEach((chunk, ci) => {
     const menu = new StringSelectMenuBuilder()
-      .setCustomId(`pl:delMenu:${plist.name}:${ci}`)
+      .setCustomId(makeId('pl', 'delMenu', userId, encName(plist.name), String(ci)))
       .setPlaceholder('اختر عناصر للحذف')
       .setMinValues(1)
       .setMaxValues(chunk.length)
@@ -355,11 +369,26 @@ const showDeleteMenus = (plist) => {
   return rows;
 };
 
+// حصر تفاعل البلايليست بمالك الواجهة
+const ensureOwner = async (interaction, ownerId) => {
+  if (interaction.user.id !== ownerId) {
+    await interaction.reply({ content: 'هذه الواجهة ليست لك.', ephemeral: true }).catch(() => {});
+    return false;
+  }
+  return true;
+};
+
 // ====== أحداث Lavalink ======
-client.lavalink.on('trackStart', async (player) => {
+client.lavalink.on('trackStart', async (player, track) => {
   const guild = client.guilds.cache.get(player.guildId);
   if (!guild) return;
   const settings = await ensureGuild(guild.id);
+
+  // إدارة التاريخ
+  const last = lastTrackMap.get(player.guildId);
+  if (last) pushHistory(player.guildId, last);
+  lastTrackMap.set(player.guildId, track || player.queue.current);
+
   const ch = await client.channels.fetch(settings.controlChannelId).catch(() => null);
   if (!ch) return;
   await ensurePanel(guild, ch, player, settings);
@@ -370,16 +399,36 @@ client.lavalink.on('queueEnd', async (player) => {
   if (!guild) return;
   const settings = await ensureGuild(guild.id);
   if (settings.loopMode === 'queue') {
-    while (player.queue.previous.length) {
-      const prev = player.queue.previous.shift();
-      player.queue.add(prev);
+    const q = player.queue;
+    // أعد تدوير ما تم تشغيله
+    while (q.previous?.length) {
+      const prev = q.previous.shift();
+      q.add(prev);
     }
-    if (player.queue.tracks.length) await player.play(player.queue.tracks.shift());
+    if (q.tracks.length) await player.play(q.tracks.shift());
   }
 });
 
+// ====== إدارة فلاتر الصوت (8D / ريسيت) ======
+const apply8D = async (player) => {
+  try {
+    await player.setFilters({ rotation: { rotationHz: 0.2 } });
+    return true;
+  } catch {
+    return false;
+  }
+};
+const resetFilters = async (player) => {
+  try {
+    await player.setFilters({}); // إزالة جميع الفلاتر
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 // ====== Interaction Handlers ======
-const deleteToggleUsers = new Set();
+const deleteToggleUsers = new Set(); // userId => وضع حذف مفعل
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isButton()) {
@@ -389,6 +438,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const settings = await ensureGuild(guild.id);
 
+    // أزرار التحكم العامة
     if (customId.startsWith('ctl:')) {
       const player =
         client.lavalink.players.get(guild.id) ||
@@ -416,12 +466,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
         else await player.pause();
         await interaction.deferUpdate().catch(() => {});
       } else if (customId === 'ctl:stop') {
-        player.queue.clear();
-        await player.stopPlaying(true);
+        try {
+          settings.loopMode = 'off';
+          settings.shuffle = false;
+          await settings.save();
+          player.queue.clear();
+          await player.stop().catch(() => {}); // إيقاف آمن
+          if (player.connected) await player.disconnect().catch(() => {});
+          lastTrackMap.delete(guild.id);
+          historyMap.delete(guild.id);
+        } catch {}
         await interaction.deferUpdate().catch(() => {});
       } else if (customId === 'ctl:skip') {
         if (player.queue.tracks.length || settings.loopMode !== 'off') {
-          await playNext(player, settings, { keepCurrent: false, random: false });
+          await player.skip().catch(() => {});
         }
         await interaction.deferUpdate().catch(() => {});
       } else if (customId === 'ctl:shuffle') {
@@ -443,14 +501,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await settings.save();
         await interaction.deferUpdate().catch(() => {});
       } else if (customId === 'ctl:next') {
-        await playNext(player, settings, { keepCurrent: true, random: settings.shuffle });
+        await player.skip().catch(() => {});
         await interaction.deferUpdate().catch(() => {});
       } else if (customId === 'ctl:prev') {
-        await playPrev(player, settings);
+        await playPrevCustom(player, settings).catch(() => {});
         await interaction.deferUpdate().catch(() => {});
       } else if (customId === 'ctl:playlist') {
-        const rows = await buildPlaylistsListMessage(guild.id, interaction.user.id);
-        await interaction.reply({ content: 'قوائمك:', components: rows, ephemeral: true }).catch(() => {});
+        const rows = await buildPlaylistsListRows(guild.id, interaction.user.id);
+        await interaction.reply({ content: `قوائم ${interaction.user}:`, components: rows, ephemeral: false }).catch(() => {});
       } else if (customId === 'ctl:save') {
         const lists = await PlaylistModel.find({ guildId: guild.id, userId: interaction.user.id }).sort({ name: 1 });
         if (!lists.length) {
@@ -459,159 +517,201 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         const row = new ActionRowBuilder();
         for (const l of lists.slice(0, 5)) {
-          row.addComponents(new ButtonBuilder().setCustomId(`pl:saveInto:${l.name}`).setLabel(l.name).setStyle(ButtonStyle.Primary));
+          row.addComponents(
+            new ButtonBuilder()
+              .setCustomId(makeId('pl', 'saveInto', interaction.user.id, encName(l.name)))
+              .setLabel(l.name)
+              .setStyle(ButtonStyle.Primary),
+          );
         }
-        await interaction.reply({ content: 'اختر قائمة لحفظ الأغنية الحالية:', components: [row], ephemeral: true }).catch(() => {});
+        await interaction.reply({ content: 'اختر قائمة لحفظ الأغنية الحالية:', components: [row], ephemeral: false }).catch(() => {});
       }
       return;
     }
 
-    if (customId === PLAYLIST_DELETE_TOGGLE_ID) {
-      if (deleteToggleUsers.has(interaction.user.id)) deleteToggleUsers.delete(interaction.user.id);
-      else deleteToggleUsers.add(interaction.user.id);
-      await interaction.deferUpdate().catch(() => {});
-      return;
-    }
+    // أزرار البلايليست
+    if (customId.startsWith('pl|')) {
+      const parts = parseId(customId); // ['pl','action','ownerId',...]
+      const action = parts[1];
+      const ownerId = parts[2];
 
-    if (customId.startsWith('pl:create:')) {
-      const modal = new ModalBuilder().setCustomId('pl:modalCreate').setTitle('إنشاء بلايليست');
-      const nameInput = new TextInputBuilder().setCustomId('pl:name').setLabel('اسم البلايليست').setStyle(TextInputStyle.Short).setMaxLength(32).setRequired(true);
-      modal.addComponents(new ActionRowBuilder().addComponents(nameInput));
-      await interaction.showModal(modal).catch(() => {});
-      return;
-    }
+      if (!(await ensureOwner(interaction, ownerId))) return;
 
-    if (customId.startsWith('pl:open:')) {
-      const name = customId.split(':')[15];
-      if (deleteToggleUsers.has(interaction.user.id)) {
-        await PlaylistModel.deleteOne({ guildId: interaction.guildId, userId: interaction.user.id, name });
-        deleteToggleUsers.delete(interaction.user.id);
-        await interaction.update({ content: 'تم الحذف. أعد فتح واجهة البلايليست.', components: [] }).catch(() => {});
-      } else {
-        const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: interaction.user.id, name });
-        if (!pl) return interaction.reply({ content: 'القائمة غير موجودة.', ephemeral: true }).catch(() => {});
-        const { embed, rows } = buildSinglePlaylistView(pl);
-        await interaction.reply({ embeds: [embed], components: rows, ephemeral: true }).catch(() => {});
+      if (action === 'toggleDelete') {
+        if (deleteToggleUsers.has(ownerId)) deleteToggleUsers.delete(ownerId);
+        else deleteToggleUsers.add(ownerId);
+        await interaction.reply({ content: `وضع الحذف: ${deleteToggleUsers.has(ownerId) ? 'تشغيل' : 'إيقاف'}`, ephemeral: true }).catch(() => {});
+        return;
       }
-      return;
-    }
 
-    if (customId.startsWith('pl:add:')) {
-      const name = customId.split(':')[15];
-      const modal = new ModalBuilder().setCustomId(`pl:modalAdd:${name}`).setTitle(`إضافة إلى: ${name}`);
-      for (let i = 1; i <= 5; i++) {
-        const input = new TextInputBuilder()
-          .setCustomId(`song${i}`)
-          .setLabel(`أدخل اسم/رابط أغنية ${i}`)
+      if (action === 'create') {
+        const modal = new ModalBuilder().setCustomId(makeId('pl', 'modalCreate', ownerId)).setTitle('إنشاء بلايليست');
+        const nameInput = new TextInputBuilder()
+          .setCustomId('pl-name')
+          .setLabel('اسم البلايليست')
           .setStyle(TextInputStyle.Short)
-          .setRequired(false)
-          .setMaxLength(256);
-        modal.addComponents(new ActionRowBuilder().addComponents(input));
-      }
-      await interaction.showModal(modal).catch(() => {});
-      return;
-    }
-
-    if (customId.startsWith('pl:del:')) {
-      const name = customId.split(':')[15];
-      const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: interaction.user.id, name });
-      if (!pl) return interaction.reply({ content: 'القائمة غير موجودة.', ephemeral: true }).catch(() => {});
-      const rows = showDeleteMenus(pl);
-      await interaction.reply({ content: 'اختر العناصر لحذفها:', components: rows, ephemeral: true }).catch(() => {});
-      return;
-    }
-
-    if (customId.startsWith('pl:play:')) {
-      const name = customId.split(':')[15];
-      const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: interaction.user.id, name });
-      if (!pl || !pl.items.length) return interaction.reply({ content: 'القائمة فارغة.', ephemeral: true }).catch(() => {});
-
-      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      const vc = member?.voice?.channel;
-      if (!vc || vc.type !== ChannelType.GuildVoice) {
-        return interaction.reply({ content: 'يجب أن تكون في روم صوتي.', ephemeral: true }).catch(() => {});
+          .setMaxLength(32)
+          .setRequired(true);
+        modal.addComponents(new ActionRowBuilder().addComponents(nameInput));
+        await interaction.showModal(modal).catch(() => {});
+        return;
       }
 
-      const settings = await ensureGuild(interaction.guildId);
-      let player = client.lavalink.players.get(interaction.guildId);
-      if (!player) {
-        player = client.lavalink.createPlayer({
-          guildId: interaction.guildId,
-          voiceChannelId: vc.id,
-          textChannelId: settings.controlChannelId,
-          volume: settings.volume,
-          selfDeaf: true,
-        });
-        await player.connect();
-      }
-
-      for (const it of pl.items) {
-        const res = await searchWithFallback(player, it.uri || it.title, interaction.user);
-        if (res?.tracks?.length) {
-          await enqueueTracks(player, [res.tracks]);
+      if (action === 'open') {
+        const name = decName(parts[3]);
+        if (deleteToggleUsers.has(ownerId)) {
+          await PlaylistModel.deleteOne({ guildId: interaction.guildId, userId: ownerId, name });
+          deleteToggleUsers.delete(ownerId);
+          await interaction.reply({ content: `تم حذف القائمة: ${name}.`, ephemeral: false }).catch(() => {});
+        } else {
+          const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: ownerId, name });
+          if (!pl) return interaction.reply({ content: 'القائمة غير موجودة.', ephemeral: true }).catch(() => {});
+          const { embed, rows } = buildSinglePlaylistView(pl, ownerId);
+          await interaction.reply({ embeds: [embed], components: rows, ephemeral: false }).catch(() => {});
         }
+        return;
       }
-      await interaction.reply({ content: `تمت إضافة قائمة ${name} إلى الطابور.`, ephemeral: true }).catch(() => {});
-      return;
-    }
 
-    if (customId.startsWith('pl:saveInto:')) {
-      const name = customId.split(':')[15];
-      const player = client.lavalink.players.get(interaction.guildId);
-      const current = player?.queue?.current;
-      if (!current) {
-        return interaction.reply({ content: 'لا توجد أغنية حالية.', ephemeral: true }).catch(() => {});
+      if (action === 'back') {
+        const rows = await buildPlaylistsListRows(interaction.guildId, ownerId);
+        await interaction.reply({ content: `قوائم ${interaction.user}:`, components: rows, ephemeral: false }).catch(() => {});
+        return;
       }
-      const art = resolveArtwork(current);
-      await PlaylistModel.updateOne(
-        { guildId: interaction.guildId, userId: interaction.user.id, name },
-        {
-          $setOnInsert: { guildId: interaction.guildId, userId: interaction.user.id, name, items: [] },
-          $push: {
-            items: {
-              title: current.info.title,
-              uri: current.info.uri,
-              source: current.info.sourceName,
-              duration: current.info.length,
-              artworkUrl: art,
+
+      if (action === 'add') {
+        const name = decName(parts[3]);
+        const modal = new ModalBuilder().setCustomId(makeId('pl', 'modalAdd', ownerId, encName(name))).setTitle(`إضافة إلى: ${name}`);
+        for (let i = 1; i <= 5; i++) {
+          const input = new TextInputBuilder()
+            .setCustomId(`song${i}`)
+            .setLabel(`أدخل اسم/رابط أغنية ${i}`)
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setMaxLength(256);
+          modal.addComponents(new ActionRowBuilder().addComponents(input));
+        }
+        await interaction.showModal(modal).catch(() => {});
+        return;
+      }
+
+      if (action === 'del') {
+        const name = decName(parts[3]);
+        const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: ownerId, name });
+        if (!pl) return interaction.reply({ content: 'القائمة غير موجودة.', ephemeral: true }).catch(() => {});
+        const rows = showDeleteMenus(pl, ownerId);
+        if (!rows.length) {
+          await interaction.reply({ content: 'القائمة فارغة.', ephemeral: true }).catch(() => {});
+          return;
+        }
+        await interaction.reply({ content: `اختر العناصر للحذف من ${name}:`, components: rows, ephemeral: false }).catch(() => {});
+        return;
+      }
+
+      if (action === 'play') {
+        const name = decName(parts[3]);
+        const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: ownerId, name });
+        if (!pl || !pl.items.length) return interaction.reply({ content: 'القائمة فارغة.', ephemeral: true }).catch(() => {});
+
+        const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const vc = member?.voice?.channel;
+        if (!vc || vc.type !== ChannelType.GuildVoice) {
+          return interaction.reply({ content: 'يجب أن تكون في روم صوتي.', ephemeral: true }).catch(() => {});
+        }
+
+        const settings = await ensureGuild(interaction.guildId);
+        let player = client.lavalink.players.get(interaction.guildId);
+        if (!player) {
+          player = client.lavalink.createPlayer({
+            guildId: interaction.guildId,
+            voiceChannelId: vc.id,
+            textChannelId: settings.controlChannelId,
+            volume: settings.volume,
+            selfDeaf: true,
+          });
+          await player.connect();
+        }
+
+        for (const it of pl.items) {
+          const q = it.uri || it.title;
+          const res = await searchWithFallback(player, q, interaction.user).catch(() => null);
+          if (res?.tracks?.length) {
+            const tracksToAdd = res.playlist ? res.tracks : [res.tracks[0]];
+            await enqueueTracks(player, tracksToAdd);
+          }
+        }
+        await interaction.reply({ content: `تمت إضافة قائمة ${name} إلى الطابور.`, ephemeral: false }).catch(() => {});
+        return;
+      }
+
+      if (action === 'saveInto') {
+        const name = decName(parts[3]);
+        const player = client.lavalink.players.get(interaction.guildId);
+        const current = player?.queue?.current;
+        if (!current) {
+          return interaction.reply({ content: 'لا توجد أغنية حالية.', ephemeral: true }).catch(() => {});
+        }
+        const art = resolveArtwork(current);
+        await PlaylistModel.updateOne(
+          { guildId: interaction.guildId, userId: ownerId, name },
+          {
+            $setOnInsert: { guildId: interaction.guildId, userId: ownerId, name, items: [] },
+            $push: {
+              items: {
+                title: current.info.title,
+                uri: current.info.uri,
+                source: current.info.sourceName,
+                duration: current.info.length,
+                artworkUrl: art,
+              },
             },
           },
-        },
-        { upsert: true },
-      );
-      await interaction.update({ content: `تم حفظ الأغنية في ${name}.`, components: [] }).catch(() => {});
-      return;
+          { upsert: true },
+        );
+        await interaction.reply({ content: `تم حفظ الأغنية في ${name}.`, ephemeral: false }).catch(() => {});
+        return;
+      }
     }
   }
 
   if (interaction.isStringSelectMenu()) {
-    if (interaction.customId.startsWith('pl:delMenu:')) {
-      const [, , name] = interaction.customId.split(':');
+    const parts = parseId(interaction.customId);
+    if (parts[0] === 'pl' && parts[1] === 'delMenu') {
+      const ownerId = parts[2];
+      if (!(await ensureOwner(interaction, ownerId))) return;
+      const name = decName(parts[3]);
       const indexes = interaction.values.map((v) => parseInt(v, 10)).sort((a, b) => b - a);
-      const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: interaction.user.id, name });
+      const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: ownerId, name });
       if (!pl) return interaction.reply({ content: 'القائمة غير موجودة.', ephemeral: true }).catch(() => {});
       for (const idx of indexes) {
         if (idx >= 0 && idx < pl.items.length) pl.items.splice(idx, 1);
       }
       await pl.save();
-      await interaction.update({ content: 'تم الحذف من القائمة.', components: [] }).catch(() => {});
+      await interaction.reply({ content: `تم الحذف من ${name}.`, ephemeral: false }).catch(() => {});
     }
   }
 
   if (interaction.isModalSubmit()) {
-    if (interaction.customId === 'pl:modalCreate') {
-      const name = interaction.fields.getTextInputValue('pl:name').trim();
+    const parts = parseId(interaction.customId);
+
+    if (parts[0] === 'pl' && parts[1] === 'modalCreate') {
+      const ownerId = parts[2];
+      if (!(await ensureOwner(interaction, ownerId))) return;
+      const name = interaction.fields.getTextInputValue('pl-name').trim();
       if (!name) return interaction.reply({ content: 'اسم غير صالح.', ephemeral: true }).catch(() => {});
       await PlaylistModel.updateOne(
-        { guildId: interaction.guildId, userId: interaction.user.id, name },
-        { $setOnInsert: { guildId: interaction.guildId, userId: interaction.user.id, name, items: [] } },
+        { guildId: interaction.guildId, userId: ownerId, name },
+        { $setOnInsert: { guildId: interaction.guildId, userId: ownerId, name, items: [] } },
         { upsert: true },
       );
-      await interaction.reply({ content: `تم إنشاء ${name}.`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `تم إنشاء ${name}.`, ephemeral: false }).catch(() => {});
       return;
     }
-    if (interaction.customId.startsWith('pl:modalAdd:')) {
-      const name = interaction.customId.split(':')[15];
+
+    if (parts[0] === 'pl' && parts[1] === 'modalAdd') {
+      const ownerId = parts[2];
+      const name = decName(parts[3]);
+      if (!(await ensureOwner(interaction, ownerId))) return;
+
       const fields = [];
       for (let i = 1; i <= 5; i++) {
         const v = interaction.fields.getTextInputValue(`song${i}`)?.trim();
@@ -619,7 +719,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (!fields.length) return interaction.reply({ content: 'لا مدخلات.', ephemeral: true }).catch(() => {});
 
-      const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: interaction.user.id, name });
+      const pl = await PlaylistModel.findOne({ guildId: interaction.guildId, userId: ownerId, name });
       if (!pl) return interaction.reply({ content: 'القائمة غير موجودة.', ephemeral: true }).catch(() => {});
 
       const settings = await ensureGuild(interaction.guildId);
@@ -633,21 +733,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
           selfDeaf: true,
         });
       }
+
       for (const q of fields) {
         const res = await searchWithFallback(player, q, interaction.user);
         if (res?.tracks?.length) {
-          const t = res.tracks;
-          pl.items.push({
-            title: t.info.title,
-            uri: t.info.uri,
-            source: t.info.sourceName,
-            duration: t.info.length,
-            artworkUrl: resolveArtwork(t),
-          });
+          // أضف أول نتيجة فقط
+          const t = res.playlist ? res.tracks[0] : res.tracks[0];
+          if (t) {
+            pl.items.push({
+              title: t.info.title,
+              uri: t.info.uri,
+              source: t.info.sourceName,
+              duration: t.info.length,
+              artworkUrl: resolveArtwork(t),
+            });
+          }
         }
       }
+
       await pl.save();
-      await interaction.reply({ content: `تمت الإضافة إلى ${name}.`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `تمت الإضافة إلى ${name}.`, ephemeral: false }).catch(() => {});
       return;
     }
   }
@@ -657,34 +762,63 @@ client.on(Events.InteractionCreate, async (interaction) => {
 client.on('messageCreate', async (msg) => {
   if (msg.author.bot) return;
   if (!msg.guild) return;
+
+  const content = msg.content?.trim();
+  if (!content) return;
+
+  // أوامر واجهة البلايليست (من أي روم)
+  if (content === 'بلايليست') {
+    const rows = await buildPlaylistsListRows(msg.guild.id, msg.author.id);
+    await msg.channel.send({ content: `قوائم ${msg.author}:`, components: rows }).catch(() => {});
+    return;
+  }
+
+  // فلاتر 8D/ريسيت (من أي روم)
+  if (content === '!8D' || content === '!ريسيت') {
+    const member = await msg.guild.members.fetch(msg.author.id).catch(() => null);
+    const vc = member?.voice?.channel;
+    if (!vc || vc.type !== ChannelType.GuildVoice) {
+      await msg.reply('يجب أن تكون في روم صوتي.').catch(() => {});
+      return;
+    }
+    const settings = await ensureGuild(msg.guild.id);
+    let player = client.lavalink.players.get(msg.guild.id);
+    if (!player) {
+      player = client.lavalink.createPlayer({
+        guildId: msg.guild.id,
+        voiceChannelId: vc.id,
+        textChannelId: settings.controlChannelId,
+        volume: settings.volume,
+        selfDeaf: true,
+      });
+      await player.connect().catch(() => {});
+    } else {
+      // تأكد أن المستخدم في نفس روم البوت إذا كان متصلاً
+      if (player.voiceChannelId && player.voiceChannelId !== vc.id) {
+        await msg.reply('يجب أن تكون في نفس الروم الصوتي مع البوت.').catch(() => {});
+        return;
+      }
+    }
+
+    if (content === '!8D') {
+      const ok = await apply8D(player);
+      await msg.reply(ok ? 'تم تفعيل 8D.' : 'تعذر تفعيل 8D.').catch(() => {});
+    } else if (content === '!ريسيت') {
+      const ok = await resetFilters(player);
+      await msg.reply(ok ? 'تم إعادة ضبط الفلاتر.' : 'تعذر إعادة ضبط الفلاتر.').catch(() => {});
+    }
+    return;
+  }
+
+  // تشغيل الموسيقى: حصره في روم التحكم فقط
   if (msg.channel.id !== CONTROL_TEXT_CHANNEL_ID) return;
 
   const settings = await ensureGuild(msg.guild.id);
 
-  const userMsg = msg;
-  const content = userMsg.content?.trim();
-  if (!content) {
-    try { await userMsg.delete(); } catch (_) {}
-    return;
-  }
-  if (content === 'بلايليست') {
-    const rows = await buildPlaylistsListMessage(msg.guild.id, msg.author.id);
-    const sent = await msg.channel.send({ content: 'قوائمك:', components: rows }).catch(() => null);
-    setTimeout(() => {
-      userMsg.delete().catch(() => {});
-      sent?.delete().catch(() => {});
-    }, 5000);
-    return;
-  }
-
   const member = await msg.guild.members.fetch(msg.author.id).catch(() => null);
   const vc = member?.voice?.channel;
   if (!vc || vc.type !== ChannelType.GuildVoice) {
-    const warn = await msg.channel.send('يجب أن تكون في روم صوتي ليتم التشغيل.').catch(() => null);
-    setTimeout(() => {
-      userMsg.delete().catch(() => {});
-      warn?.delete().catch(() => {});
-    }, 4000);
+    await msg.channel.send('يجب أن تكون في روم صوتي ليتم التشغيل.').catch(() => {});
     return;
   }
 
@@ -698,43 +832,32 @@ client.on('messageCreate', async (msg) => {
       selfDeaf: true,
     });
 
-
   if (!player.connected) await player.connect().catch(() => {});
 
   const res = await searchWithFallback(player, content, msg.author);
   if (!res || !res.tracks?.length) {
-    const no = await msg.channel.send('لم أجد نتائج.').catch(() => null);
-    setTimeout(() => {
-      userMsg.delete().catch(() => {});
-      no?.delete().catch(() => {});
-    }, 4000);
+    await msg.channel.send('لم أجد نتائج.').catch(() => {});
     return;
   }
 
   let ok = false;
+  // إذا كانت Playlist أضف الكل، غير ذلك أضف أول نتيجة فقط
   if (res.loadType === 'playlist' || res.playlist) {
     ok = await enqueueTracks(player, res.tracks);
   } else {
-    ok = await enqueueTracks(player, [res.tracks]);
+    ok = await enqueueTracks(player, [res.tracks[0]]);
   }
 
-  const conf = ok ? await msg.channel.send('تمت إضافة طلبك وسيبدأ التشغيل.').catch(() => null) : null;
-  setTimeout(() => {
-    userMsg.delete().catch(() => {});
-    conf?.delete().catch(() => {});
-  }, 4000);
+  if (ok) await msg.channel.send('تمت إضافة طلبك وسيبدأ التشغيل.').catch(() => {});
 
   const ch = await client.channels.fetch(settings.controlChannelId).catch(() => null);
   if (ch) await ensurePanel(msg.guild, ch, player, settings);
-})
-;
-
-
+});
 
 // ====== إقلاع + Mongo + دخول ======
 (async () => {
   try {
-    await mongoose.connect("mongodb+srv://Nael:i8VFiKISASCUzX5O@discordbot.wzwjonu.mongodb.net/?retryWrites=true&w=majority&appName=DiscordBot", { dbName: 'discord_casino' });
+    await mongoose.connect(process.env.MONGO_URI, { dbName: process.env.MONGO_DB || 'discord_casino' });
     console.log('MongoDB connected');
 
     client.on(Events.ClientReady, async () => {
