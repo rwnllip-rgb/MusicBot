@@ -22,6 +22,20 @@ const {
 
 const mongoose = require('mongoose');
 const { LavalinkManager } = require('lavalink-client');
+// keepalive http server for Render Web Service
+const http = require('http');
+const PORT = process.env.PORT || 10000;
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end('OK');
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Discord bot is running');
+});
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`HTTP server listening on ${PORT}`);
+});
 
 // ====== إعدادات ثابتة ======
 const CONTROL_TEXT_CHANNEL_ID = process.env.CONTROL_TEXT_CHANNEL_ID || '1410843136594411520';
@@ -857,7 +871,7 @@ client.on('messageCreate', async (msg) => {
 // ====== إقلاع + Mongo + دخول ======
 (async () => {
   try {
-    await mongoose.connect(process.env.MONGO_URI, { dbName: process.env.MONGO_DB || 'discord_casino' });
+    await mongoose.connect("mongodb+srv://Nael:i8VFiKISASCUzX5O@discordbot.wzwjonu.mongodb.net/?retryWrites=true&w=majority&appName=DiscordBot", { dbName: 'discord_casino' });
     console.log('MongoDB connected');
 
     client.on(Events.ClientReady, async () => {
